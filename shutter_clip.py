@@ -342,8 +342,12 @@ def escape_filter_path(path):
     return p
 
 
-def vf_chain(meta, mode, lut=None):
-    """Build the -vf chain. mode is 'h' or 'v'. Returns (chain, tonemapped)."""
+def vf_chain(meta, mode, lut=None, canvas=None):
+    """Build the -vf chain. mode is 'h' or 'v'. Returns (chain, tonemapped).
+
+    canvas=(w, h) forces an exact fill-crop output at 30 fps 8-bit,
+    used for montage segments so concat gets identical streams.
+    """
     parts = []
     tonemapped = False
     if meta.hdr:
@@ -362,6 +366,13 @@ def vf_chain(meta, mode, lut=None):
             )
     if lut:
         parts.append("lut3d=file='%s'" % escape_filter_path(lut))
+    if canvas:
+        cw, ch = canvas
+        parts.append(
+            "scale=%d:%d:force_original_aspect_ratio=increase,"
+            "crop=%d:%d,fps=30,format=yuv420p,setsar=1" % (cw, ch, cw, ch)
+        )
+        return ",".join(parts), tonemapped
     portrait = meta.height > meta.width
     if mode == "h":
         # For portrait sources the "phone-ready" target is 1080 wide,
@@ -379,11 +390,13 @@ def vf_chain(meta, mode, lut=None):
     return ",".join(parts), tonemapped
 
 
-def transcode(meta, out_path, mode, opts, start=None, dur=None):
+def transcode(meta, out_path, mode, opts, start=None, dur=None,
+              canvas=None, no_audio=False):
     """Encode one output file. Returns seconds elapsed."""
-    chain, tonemapped = vf_chain(meta, mode, opts.lut)
+    chain, tonemapped = vf_chain(meta, mode, opts.lut, canvas)
     enc_args = encoder_video_args(
-        opts.encoder_name, meta, tonemapped, opts.bitrate, opts.crf, opts.preset
+        opts.encoder_name, meta, tonemapped or bool(canvas),
+        opts.bitrate, opts.crf, opts.preset
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if start is not None:
@@ -396,7 +409,7 @@ def transcode(meta, out_path, mode, opts, start=None, dur=None):
         cmd += ["-map", "0:%d" % meta.aindex]
     cmd += ["-vf", chain]
     cmd += enc_args
-    cmd += audio_args(meta)
+    cmd += ["-an"] if no_audio else audio_args(meta)
     if not meta.hdr or tonemapped:
         cmd += [
             "-colorspace", "bt709",
@@ -761,11 +774,14 @@ WHAT IS IN THIS FOLDER
 
 post-ready/
     Finished clips, ready to AirDrop and post. Nothing needs editing.
-    tiktok + reels/            horizontal picks, grouped by content type
+    tiktok + reels/               horizontal picks, grouped by content type
     shorts + stories - vertical/  the same moments as 9:16 vertical crops
-    Names read: trip - pick 2 of 3 - 14s - DJI_0603 at 3m10s - horizontal
-    That means: 14 second clip, taken 3m10s into DJI_0603, second-best
-    of three picks from that video.
+    Both packs also hold montages/: one ~30s auto-edit per trip folder,
+    5 second cuts, chronological, silent on purpose - add a trending
+    sound in the app, native audio boosts reach.
+    Pick names read: trip - pick 2 of 3 - 14s - DJI_0603 at 3m10s
+    Meaning: 14 second clip, taken 3m10s into DJI_0603, second-best of
+    three picks from that video.
 
 library/
     Every original converted once to phone-friendly 1080p, same folder
@@ -776,37 +792,148 @@ contact-sheet.html
     list, and the cut command exports them.
 
 Originals are never touched. Everything in here can be regenerated.
+See WHY.txt for the reasoning behind formats and sizes.
 """
+
+WHY_TXT = """\
+WHY THESE FORMATS
+=================
+
+1080p everywhere: TikTok and Instagram re-encode every upload to about
+1080p, so uploading 4K buys nothing on those apps. 1080p files are a
+tenth the size, AirDrop in seconds, and look identical after the app
+re-encode. The 4K originals stay untouched on the drive, and library/
+keeps a browsable 1080p twin of every one.
+
+HEVC with the hvc1 tag: half the file size of H.264 at the same quality,
+decoded natively by every iPhone since the 7. If some app ever rejects
+one, rerun with --encoder x264.
+
+Horizontal first: your call, and the tiktok + reels pack keeps it.
+Every pick also gets an automatic 9:16 center-crop twin in the shorts
+pack because stories and YT Shorts require vertical.
+
+Pick length ~14s: short clips get watched to the end, and completion
+rate is the strongest ranking signal on TikTok. Montages run ~30s with
+5s cuts for the edited feel without editing.
+
+Same look for every folder on purpose: a consistent grade across the
+feed reads as a style. Sources differ (4K drone, 6K Fuji, vertical
+phone) but every export lands on the same canvas rules, so nothing
+looks out of place next to anything else.
+
+Vertical sources are never stretched: portrait files keep their framing
+and land at 1080 wide. Landscape files are center-cropped for vertical
+twins. HDR iPhone clips currently stay HDR (this ffmpeg build cannot
+tone-map); they look right on iPhone.
+"""
+
+
+def top_folder(meta):
+    parts = Path(meta.rel).parts
+    return parts[0].strip() if len(parts) > 1 else meta.path.parent.name.strip()
+
+
+def montage_out(dest, mode, folder, seconds):
+    orient = "horizontal" if mode == "h" else "vertical"
+    name = "%s - montage - %ds - %s.mp4" % (folder, round(seconds), orient)
+    name = re.sub(r'[:*?"<>|/\\]', "-", name)
+    return dest / PLATFORM_DIR[mode] / "montages" / name
+
+
+def build_montage(folder, windows, mode, opts, dest, base):
+    """windows: [(meta, start)] chronological. Concat 5s segments."""
+    canvas = (1920, 1080) if mode == "h" else (1080, 1920)
+    seg_len = opts.montage_seg
+    out = montage_out(dest, mode, folder, seg_len * len(windows))
+    if not opts.force and out.exists():
+        return False
+    tmpdir = base / ".tmp-montage" / re.sub(r"[^A-Za-z0-9]+", "-", folder + mode)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    seg_paths = []
+    try:
+        for i, (m, start) in enumerate(windows):
+            seg = tmpdir / ("seg%02d.mp4" % i)
+            transcode(m, seg, mode, opts, start=start, dur=seg_len,
+                      canvas=canvas, no_audio=True)
+            seg_paths.append(seg)
+        lst = tmpdir / "list.txt"
+        lst.write_text(
+            "".join("file '%s'\n" % str(p).replace("'", "'\\''")
+                    for p in seg_paths),
+            encoding="utf-8",
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp_out = out.with_name(out.name + ".part")
+        run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(lst),
+            "-c", "copy", "-movflags", "+faststart", "-f", "mp4",
+            str(tmp_out),
+        ])
+        os.replace(tmp_out, out)
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def pick_candidates(metas, min_source):
+    """Depth: every file >= min_source. Breadth: every folder covered."""
+    by_folder = {}
+    for m in metas:
+        by_folder.setdefault(top_folder(m), []).append(m)
+    chosen = []
+    for folder, group in sorted(by_folder.items()):
+        deep = [m for m in group if m.duration >= min_source]
+        if len(deep) < 2:
+            floor = sorted(
+                (m for m in group if m.duration >= 10 and m not in deep),
+                key=lambda m: -m.duration,
+            )[: 2 - len(deep)]
+            deep = deep + floor
+        chosen.extend(deep)
+    return chosen
 
 
 def cmd_publish(opts):
     videos = find_videos(opts.root, opts.exclude)
     metas = probe_all(videos, opts.root)
-    metas = [m for m in metas if m.duration >= opts.min_source]
-    if not metas:
-        die("no videos of %ds+ found under %s" % (opts.min_source, opts.root))
+    candidates = pick_candidates(metas, opts.min_source)
+    if not candidates:
+        die("no usable videos under %s" % opts.root)
     base = out_root(opts)
     dest = base / "post-ready"
     modes = ["h"] if opts.horizontal_only else ["h", "v"]
-    (base).mkdir(parents=True, exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
     (base / "README.txt").write_text(PHONE_READY_README, encoding="utf-8")
+    (dest).mkdir(parents=True, exist_ok=True)
+    (dest / "WHY.txt").write_text(WHY_TXT, encoding="utf-8")
     total_out = 0
-    for fi, m in enumerate(metas, 1):
+    folder_windows = {}
+    for fi, m in enumerate(candidates, 1):
         try:
             frames = motion_profile(m)
         except RuntimeError as exc:
             print("FAIL analyze %s (%s)" % (m.rel, exc), file=sys.stderr)
             continue
+        cap = n_picks_for(m.duration) if opts.max_picks == 0 else opts.max_picks
+        if m.duration < opts.min_source:
+            cap = 1
         picks = pick_windows(
-            m, frames, opts.target_len, opts.min_len, opts.scene,
-            n_picks_for(m.duration) if opts.max_picks == 0 else opts.max_picks,
+            m, frames, opts.target_len, opts.min_len, opts.scene, cap,
         )
+        if not picks and m.duration >= opts.min_len:
+            picks = [(0.0, min(m.duration, opts.target_len), 0.0)]
         if not picks:
-            print("[%d/%d] %s: no usable window" % (fi, len(metas), m.rel))
+            print("[%d/%d] %s: no usable window" % (fi, len(candidates), m.rel))
             continue
+        for start, length, score in picks[:2]:
+            folder_windows.setdefault(top_folder(m), []).append(
+                (score, m, start, length)
+            )
         bucket = content_bucket(m)
         print("[%d/%d] %s: %d picks (%s)"
-              % (fi, len(metas), m.rel, len(picks), bucket))
+              % (fi, len(candidates), m.rel, len(picks), bucket))
         portrait = m.height > m.width
         for k, (start, length, _score) in enumerate(picks, 1):
             if portrait:
@@ -837,6 +964,42 @@ def cmd_publish(opts):
                 except RuntimeError as exc:
                     print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
                           file=sys.stderr)
+
+    if opts.montage_len > 0:
+        want = max(3, int(round(opts.montage_len / opts.montage_seg)))
+        for folder in sorted(folder_windows):
+            pool = folder_windows[folder]
+            for mode in modes:
+                usable = [
+                    (score, m, start, length)
+                    for score, m, start, length in pool
+                    # HDR sources would need a tonemap to sit next to SDR
+                    # cuts in one file; skip them until zscale is present.
+                    if not m.hdr and (mode == "v" or m.width >= m.height)
+                ]
+                usable.sort(key=lambda w: -w[0])
+                seen = {}
+                take = []
+                for score, m, start, length in usable:
+                    if seen.get(m.rel, 0) >= 2:
+                        continue
+                    seen[m.rel] = seen.get(m.rel, 0) + 1
+                    take.append((m, start + max(0.0, (length - opts.montage_seg) / 2)))
+                    if len(take) >= want:
+                        break
+                if len(take) < 3:
+                    continue
+                take.sort(key=lambda w: (w[0].rel, w[1]))
+                try:
+                    made = build_montage(folder, take, mode, opts, dest, base)
+                    if made:
+                        total_out += 1
+                        print("montage: %s (%s, %d cuts)"
+                              % (folder, mode, len(take)))
+                except RuntimeError as exc:
+                    print("FAIL montage %s %s (%s)" % (folder, mode, exc),
+                          file=sys.stderr)
+
     print("done. %d clips in: %s" % (total_out, dest))
 
 
@@ -1202,6 +1365,10 @@ def main(argv=None):
                     help="picks per video, 0 = scale with duration (default)")
     sp.add_argument("--horizontal-only", action="store_true",
                     help="skip the vertical variants")
+    sp.add_argument("--montage-len", type=float, default=30.0,
+                    help="target seconds per folder montage, 0 disables")
+    sp.add_argument("--montage-seg", type=float, default=5.0,
+                    help="seconds per montage cut (default 5)")
     sp.add_argument("--force", action="store_true",
                     help="re-encode even if the output is fresh")
 
