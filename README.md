@@ -1,5 +1,13 @@
 # shutter-clip
 
+[![CI](https://github.com/keivanmalhani/shutter-clip/actions/workflows/ci.yml/badge.svg)](https://github.com/keivanmalhani/shutter-clip/actions/workflows/ci.yml)
+![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python 3.11+ stdlib only](https://img.shields.io/badge/python-3.11%2B%20stdlib%20only-blue.svg)
+
+English | [Espanol](README.es.md)
+
+![shutter-clip demo: scan a footage drive, publish motion-ranked picks, deep-rank with shutter-select](docs/demo.gif)
+
 Zero-edit social clips straight from a footage drive. Point it at the SSD,
 get phone-ready files you can AirDrop and post as-is. Nothing is uploaded
 anywhere and source files are never touched.
@@ -121,6 +129,21 @@ python3 shutter_clip.py cut picks.txt "/Volumes/Crucial X10"
 Pick lines look like `folder/clip.MOV @ 1:42` (12 s from there),
 `... @ 1:42-1:55` for an exact range, trailing ` v` for vertical.
 
+## Development
+
+```zsh
+python3 -m pytest tests/ -q
+```
+
+62 tests, no committed media: fixtures are rendered with ffmpeg at run
+time (x264 ultrafast, tiny frames). The suite covers the motion scorer
+(edge damping, dark penalty, cut boundaries, start-spike clamp), the
+plain-english naming and exFAT sanitizing, content buckets, segment
+splitting, the whole rank stage (tie-averaged percentiles, social
+weights, skip reasons, the shutter-select cache contract), and real
+ffmpeg round trips for scan, cut, and clips --copy. CI runs it all on
+every push.
+
 ## Notes
 
 - `clips --copy` stream-copies the original 4K with zero quality loss and
@@ -133,4 +156,4 @@ Pick lines look like `folder/clip.MOV @ 1:42` (12 s from there),
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
