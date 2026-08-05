@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Only github-actions: shutter-clip is stdlib-only and ships no pip
+  # manifest, so there is nothing for the pip ecosystem to scan. The CI
+  # workflow's pinned action versions are the whole dependency surface.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
