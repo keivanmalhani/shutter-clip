@@ -135,7 +135,7 @@ Pick lines look like `folder/clip.MOV @ 1:42` (12 s from there),
 python3 -m pytest tests/ -q
 ```
 
-62 tests, no committed media: fixtures are rendered with ffmpeg at run
+53 tests, no committed media: fixtures are rendered with ffmpeg at run
 time (x264 ultrafast, tiny frames). The suite covers the motion scorer
 (edge damping, dark penalty, cut boundaries, start-spike clamp), the
 plain-english naming and exFAT sanitizing, content buckets, segment
