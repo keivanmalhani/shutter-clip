@@ -9,9 +9,13 @@ Subcommands:
   mirror   phone-ready 1080p copy of every clip into _phone-ready/library/
   publish  motion-ranked best moments, named readably and organized into
            platform packs (tiktok + reels, shorts + stories) by content type
+  rank     deep-rank footage using shutter-select's analysis (speech, audio
+           quality, sharpness, motion): ranked report + picks file for cut
   clips    plain auto-cut into short pieces via scene detection
   sheet    build a self-contained HTML contact sheet for picking moments
   cut      export exact moments listed in a picks file
+  frames   dump 3-frame review strips for every published pick
+  curate   apply keep/kill/top verdicts from a frames review
 
 Design rules:
   - Horizontal 1920x1080 is the default output. Vertical 1080x1920 center
@@ -27,12 +31,14 @@ Copyright: MIT. Part of the shutter-* family.
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1287,6 +1293,435 @@ def cmd_publish(opts):
     print("done. %d clips in: %s" % (total_out, dest))
 
 
+# ---------------------------------------------------------------- rank
+#
+# Idea 5 phase 1: consume shutter-select's per-file analysis JSON and
+# re-rank every analyzed segment with social weights. The contract is the
+# cache JSON only (schema_version 1): shutter-select is never imported,
+# and when --analyze is passed its CLI runs as a subprocess. Raw features
+# are stored in the cache precisely so this re-weighting needs no
+# re-analysis (see the shutter-select spec, "Cache JSON contract").
+
+
+SELECTS_SCHEMA = 1
+SELECTS_DIR_NAME = "_selects"
+
+# Social weight sets. Same percentile-normalize-within-class pattern as
+# shutter-select's scoring, different priorities: for feed clips motion
+# and hook energy outrank the interview virtues. Weights of features a
+# segment is missing (faces off, say) redistribute proportionally.
+SOCIAL_SPEECH_WEIGHTS = {
+    "audio_quality": 0.25,
+    "speech_density": 0.15,
+    "motion": 0.15,
+    "sharpness": 0.15,
+    "exposure": 0.10,
+    "duration_fit": 0.10,
+    "faces": 0.10,
+}
+SOCIAL_BROLL_WEIGHTS = {
+    "motion": 0.40,
+    "sharpness": 0.25,
+    "exposure": 0.15,
+    "duration_fit": 0.20,
+}
+MIN_SPEECH_RMS_DB = -35.0  # matches shutter-select's hard-fail line
+
+
+def percentile_ranks(values):
+    """Rank positions scaled 0..1. One value ranks 0.5.
+
+    Ties share their average rank, a deliberate divergence from
+    shutter-select's index-order ties: footage drives hold identical
+    copies of the same clip in several folders, and index-order ties
+    hand one copy free rank points over the other. Averaging keeps the
+    ordering content-only and independent of walk order.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0.5]
+    order = sorted(range(n), key=lambda i: (values[i], i))
+    ranks = [0.0] * n
+    pos = 0
+    while pos < n:
+        j = pos
+        while j + 1 < n and values[order[j + 1]] == values[order[pos]]:
+            j += 1
+        avg = (pos + j) / 2.0 / (n - 1)
+        for k in range(pos, j + 1):
+            ranks[order[k]] = avg
+        pos = j + 1
+    return ranks
+
+
+def exposure_quality(seg):
+    """1.0 is clean, 0.0 is badly crushed or blown out."""
+    return 1.0 - min(
+        1.0,
+        seg.get("crushed_frac", 0.0) * 3.0 + seg.get("blown_frac", 0.0) * 4.0,
+    )
+
+
+def social_duration_fit(duration, lo, hi):
+    """Peak inside the postable band. Long takes decay gently, never to
+    zero: they are trimmable, and phase 2 sub-clips them on words."""
+    if duration <= 0:
+        return 0.0
+    if duration < lo:
+        return duration / lo
+    if duration <= hi:
+        return 1.0
+    return max(0.35, 1.0 - (duration - hi) / 60.0)
+
+
+def audio_quality_raw(seg):
+    """Speech-over-noise margin, punished by dead air. Same shape as
+    shutter-select's extractor so the two tools agree on what clean is."""
+    return seg.get("noise_margin_db", 0.0) - 20.0 * seg.get("silence_ratio", 0.0)
+
+
+def selects_cache_payload(cache_dir, path):
+    """Load one shutter-select cache JSON for a source file.
+
+    Mirrors shutter-select's own validation: schema gate first, then
+    mtime plus size, so a re-copied or re-graded file reads as stale
+    here exactly when it would over there. Returns (payload, status),
+    status one of ok, missing, stale, schema.
+    """
+    key = hashlib.sha1(
+        str(Path(path).resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    target = Path(cache_dir) / (key + ".json")
+    if not target.exists():
+        return None, "missing"
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, "stale"
+    if payload.get("schema_version") != SELECTS_SCHEMA:
+        return None, "schema"
+    recorded = payload.get("source", {})
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None, "stale"
+    if abs(recorded.get("mtime", -1) - st.st_mtime) > 1e-6:
+        return None, "stale"
+    if recorded.get("size") != st.st_size:
+        return None, "stale"
+    return payload, "ok"
+
+
+def run_select_analyze(opts, selects_dir):
+    """Run shutter-select analyze as a subprocess. The only integration
+    point is its CLI plus the cache files it writes."""
+    cmd = shlex.split(opts.select_bin) + ["analyze", str(opts.root)]
+    cmd += ["--out", str(selects_dir)]
+    if opts.select_args:
+        cmd += shlex.split(opts.select_args)
+    print("rank: running %s" % " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd)
+    except FileNotFoundError:
+        die(
+            "shutter-select not found (looked for: %s).\n"
+            "Install it (https://github.com/keivanmalhani/shutter-select) "
+            "or run the analysis yourself:\n"
+            "  shutter-select analyze %s" % (opts.select_bin, opts.root)
+        )
+    if proc.returncode != 0:
+        die("shutter-select analyze failed (exit %d)" % proc.returncode)
+
+
+def social_score(rows, min_len, max_len):
+    """Score every segment row in place: social_score 0..1 plus
+    social_percentile within its class. Percentiles are run-relative,
+    the shutter-cull/select pattern: no absolute thresholds on
+    scene-dependent features."""
+    extractors = {
+        "audio_quality": audio_quality_raw,
+        "speech_density": lambda s: s.get("words_per_second", 0.0),
+        "sharpness": lambda s: s.get("sharpness", 0.0),
+        "motion": lambda s: s.get("motion", 0.0),
+        "exposure": exposure_quality,
+        "duration_fit": lambda s: social_duration_fit(
+            s.get("duration", 0.0), min_len, max_len
+        ),
+        "faces": lambda s: s.get("face_ratio"),
+    }
+    by_class = {}
+    for i, row in enumerate(rows):
+        by_class.setdefault(row.get("klass", "broll"), []).append(i)
+    for klass, indices in by_class.items():
+        weights = (
+            SOCIAL_SPEECH_WEIGHTS if klass == "speech" else SOCIAL_BROLL_WEIGHTS
+        )
+        per_feature = {}
+        for feature in weights:
+            raws = [(extractors[feature](rows[i]), i) for i in indices]
+            present = [(v, i) for v, i in raws if v is not None]
+            ranks = percentile_ranks([v for v, _ in present])
+            table = {i: None for i in indices}
+            for (_, i), rank in zip(present, ranks):
+                table[i] = rank
+            per_feature[feature] = table
+        composites = []
+        for i in indices:
+            avail = {
+                f: w for f, w in weights.items()
+                if per_feature[f][i] is not None
+            }
+            total = sum(avail.values())
+            if total <= 0:
+                comp = 0.5
+            else:
+                comp = sum(
+                    per_feature[f][i] * (w / total) for f, w in avail.items()
+                )
+            rows[i]["social_score"] = round(comp, 4)
+            composites.append(comp)
+        for i, pct in zip(indices, percentile_ranks(composites)):
+            rows[i]["social_percentile"] = round(pct, 4)
+
+
+def social_skips(row, min_len):
+    """Reasons a segment is unpostable regardless of its score. Skips are
+    decided before scoring so unpostable segments never distort the
+    percentile pool the survivors are ranked in."""
+    reasons = []
+    if row.get("frames_sampled", 0) == 0:
+        reasons.append("no frame could be decoded")
+    if row["t_out"] - row["t_in"] < min_len:
+        reasons.append("shorter than the %ds minimum" % round(min_len))
+    if row.get("klass") == "speech":
+        if row.get("clipped"):
+            reasons.append("audio clipped, distorted at full volume")
+        if row.get("rms_db", 0.0) < MIN_SPEECH_RMS_DB:
+            reasons.append("speech too quiet to post")
+    return reasons
+
+
+def clip_window(row, t_len):
+    """Postable window inside a segment. Speech hooks live at the start
+    of a take, so speech windows anchor there; b-roll centers. Word-level
+    windowing is phase 2."""
+    t_in = row["t_in"]
+    dur = row["t_out"] - t_in
+    if dur <= t_len + 2.0:
+        return t_in, dur
+    if row.get("klass") == "speech":
+        return t_in, t_len
+    return t_in + (dur - t_len) / 2.0, t_len
+
+
+def rank_reason(row):
+    bits = []
+    label = "speech takes" if row.get("klass") == "speech" else "b-roll moments"
+    bits.append("#%d of %d %s" % (row.get("class_rank", 0),
+                                  row.get("class_total", 0), label))
+    text = (row.get("transcript") or "").strip()
+    if text:
+        snippet = text if len(text) <= 47 else text[:44] + "..."
+        bits.append('"%s"' % snippet)
+    return ", ".join(bits)
+
+
+def cmd_rank(opts):
+    root = Path(opts.root)
+    selects_dir = (
+        Path(opts.selects) if opts.selects else root / SELECTS_DIR_NAME
+    )
+    if opts.analyze:
+        run_select_analyze(opts, selects_dir)
+    cache_dir = selects_dir / "cache"
+    videos = find_videos(opts.root, opts.exclude)
+    if not videos:
+        die("no videos found under %s" % opts.root)
+
+    ranked_sources = []
+    missing = []
+    stale = []
+    schema_odd = 0
+    for p in videos:
+        payload, status = selects_cache_payload(cache_dir, p)
+        if status == "ok":
+            ranked_sources.append((p, payload))
+        elif status == "missing":
+            missing.append(p)
+        elif status == "schema":
+            schema_odd += 1
+        else:
+            stale.append(p)
+
+    if not ranked_sources:
+        hint = (
+            "rerun with --analyze"
+            if not opts.analyze
+            else "check the shutter-select output above"
+        )
+        die(
+            "no usable shutter-select analysis under %s "
+            "(%d videos found, %d unanalyzed, %d stale). "
+            "Run:  shutter-select analyze %s   or %s"
+            % (cache_dir, len(videos), len(missing), len(stale),
+               opts.root, hint)
+        )
+
+    rows = []
+    for p, payload in ranked_sources:
+        rel = str(p.relative_to(root))
+        for seg in payload.get("segments", []):
+            row = dict(seg)
+            row["rel"] = rel
+            row["path"] = str(p)
+            rows.append(row)
+    if not rows:
+        die("analysis found no segments to rank under %s" % opts.root)
+
+    skipped = []
+    usable = []
+    for row in rows:
+        reasons = social_skips(row, opts.min_len)
+        if reasons:
+            row["skip_reasons"] = reasons
+            skipped.append(row)
+        else:
+            usable.append(row)
+    if not usable:
+        why = sorted({r for row in skipped for r in row["skip_reasons"]})
+        die(
+            "all %d segments are unpostable (%s). Lower --min-len?"
+            % (len(rows), "; ".join(why))
+        )
+    social_score(usable, opts.min_len, opts.max_len)
+    usable.sort(key=lambda r: -r["social_score"])
+    class_totals = {}
+    for row in usable:
+        k = row.get("klass", "broll")
+        class_totals[k] = class_totals.get(k, 0) + 1
+        row["class_rank"] = class_totals[k]
+    for row in usable:
+        row["class_total"] = class_totals[row.get("klass", "broll")]
+
+    # One window per ranked segment, target length by content type
+    # unless overridden, the publish convention.
+    for row in usable:
+        m = Meta()
+        m.path = Path(row["path"])
+        m.rel = row["rel"]
+        bucket = content_bucket(m)
+        t_len = opts.clip_len or BUCKET_TARGET.get(bucket, 14.0)
+        start, length = clip_window(row, t_len)
+        row["bucket"] = bucket
+        row["window_start"] = round(start, 2)
+        row["window_len"] = round(length, 2)
+
+    top_n = opts.top if opts.top > 0 else len(usable)
+    picked = usable[:top_n]
+
+    out_dir = out_root(opts) / "rank"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    picks_path = out_dir / "picks.txt"
+    lines = [
+        "# shutter-clip rank: best moments first, shutter-select scored.",
+        "# Feed to: shutter_clip.py cut %s %s" % (picks_path, opts.root),
+        "",
+    ]
+    for n, row in enumerate(picked, 1):
+        lines.append(
+            "# %d: score %d, %s, %s"
+            % (n, round(row["social_score"] * 100), row["bucket"],
+               rank_reason(row))
+        )
+        end = row["window_start"] + row["window_len"]
+        lines.append(
+            "%s @ %s-%s" % (row["rel"], fmt_tc(row["window_start"]),
+                            fmt_tc(end))
+        )
+    picks_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    ranking_path = out_dir / "ranking.json"
+    ranking_path.write_text(
+        json.dumps(
+            {
+                "tool": "shutter-clip rank",
+                "selects_schema": SELECTS_SCHEMA,
+                "root": str(root),
+                "weights": {
+                    "speech": SOCIAL_SPEECH_WEIGHTS,
+                    "broll": SOCIAL_BROLL_WEIGHTS,
+                },
+                "clips": usable,
+                "skipped": skipped,
+            },
+            indent=1,
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+
+    report_lines = []
+    show = min(len(picked), 20)
+    print()
+    print("%-4s %-5s %-7s %-5s %s" % ("rank", "score", "class", "len", "clip"))
+    print("-" * 78)
+    for n, row in enumerate(picked, 1):
+        line = "%-4d %-5d %-7s %-5s %s @ %s  (%s)" % (
+            n,
+            round(row["social_score"] * 100),
+            row.get("klass", "broll"),
+            "%ds" % round(row["window_len"]),
+            row["rel"],
+            fmt_tc(row["window_start"]),
+            rank_reason(row),
+        )
+        report_lines.append(line)
+        if n <= show:
+            print(line)
+    if len(picked) > show:
+        print("... %d more in %s" % (len(picked) - show, out_dir / "report.txt"))
+    print()
+    for row in skipped:
+        report_lines.append(
+            "skip %s @ %s  (%s)"
+            % (row["rel"], fmt_tc(row["t_in"]), "; ".join(row["skip_reasons"]))
+        )
+    coverage = "ranked %d segments from %d of %d videos" % (
+        len(usable), len(ranked_sources), len(videos)
+    )
+    extras = []
+    if skipped:
+        extras.append("%d unpostable" % len(skipped))
+    if missing:
+        extras.append("%d not analyzed" % len(missing))
+    if stale:
+        extras.append("%d stale" % len(stale))
+    if schema_odd:
+        extras.append("%d newer-schema" % schema_odd)
+    if extras:
+        coverage += " (" + ", ".join(extras) + ")"
+    print(coverage)
+    report_lines.append("")
+    report_lines.append(coverage)
+    for p in missing:
+        report_lines.append("not analyzed: %s" % p.relative_to(root))
+    for p in stale:
+        report_lines.append("stale analysis: %s" % p.relative_to(root))
+    (out_dir / "report.txt").write_text(
+        "\n".join(report_lines) + "\n", encoding="utf-8"
+    )
+    if missing or stale:
+        print(
+            "hint: %d file(s) need (re)analysis, rerun with --analyze "
+            "or run: shutter-select analyze %s" % (len(missing) + len(stale),
+                                                   opts.root)
+        )
+    print("done. picks -> %s" % picks_path)
+
+
 # ---------------------------------------------------------------- clips
 
 
@@ -1760,6 +2195,30 @@ def main(argv=None):
     sp.add_argument("--force", action="store_true",
                     help="re-encode even if the output is fresh")
 
+    sp = sub.add_parser(
+        "rank",
+        help="deep-rank moments using shutter-select analysis",
+    )
+    add_common(sp)
+    sp.add_argument("--selects", default=None,
+                    help="shutter-select output dir (default: ROOT/%s)"
+                         % SELECTS_DIR_NAME)
+    sp.add_argument("--analyze", action="store_true",
+                    help="run 'shutter-select analyze' first (subprocess)")
+    sp.add_argument("--select-bin", default="shutter-select",
+                    help="shutter-select command to run with --analyze")
+    sp.add_argument("--select-args", default="",
+                    help="extra args for analyze, e.g. \"--model small\"")
+    sp.add_argument("--top", type=int, default=20,
+                    help="picks to keep in picks.txt, 0 = all (default 20)")
+    sp.add_argument("--clip-len", type=float, default=0.0,
+                    help="pick window seconds, 0 = per type: drone 20, "
+                         "camera 12, phone 8")
+    sp.add_argument("--min-len", type=float, default=6.0,
+                    help="shortest postable seconds (default 6)")
+    sp.add_argument("--max-len", type=float, default=18.0,
+                    help="ideal longest seconds before decay (default 18)")
+
     sp = sub.add_parser("clips", help="auto-cut videos into short pieces")
     add_common(sp)
     sp.add_argument("--min-len", type=float, default=6.0,
@@ -1812,6 +2271,7 @@ def main(argv=None):
         "scan": cmd_scan,
         "mirror": cmd_mirror,
         "publish": cmd_publish,
+        "rank": cmd_rank,
         "clips": cmd_clips,
         "sheet": cmd_sheet,
         "cut": cmd_cut,
