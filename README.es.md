@@ -100,7 +100,7 @@ Las lineas de picks se ven asi: `carpeta/clip.MOV @ 1:42` para 12 s desde ahi, `
 python3 -m pytest tests/ -q
 ```
 
-62 pruebas, sin media en el repo: los fixtures se generan con ffmpeg al momento. La suite cubre el ranking de movimiento, los nombres en lenguaje claro, los buckets de contenido, el corte en segmentos, toda la etapa rank con sus percentiles de empate promediado y el contrato de cache de shutter-select, y viajes redondos reales de ffmpeg para scan, cut y clips --copy.
+53 pruebas, sin media en el repo: los fixtures se generan con ffmpeg al momento. La suite cubre el ranking de movimiento, los nombres en lenguaje claro, los buckets de contenido, el corte en segmentos, toda la etapa rank con sus percentiles de empate promediado y el contrato de cache de shutter-select, y viajes redondos reales de ffmpeg para scan, cut y clips --copy.
 
 ## Notas
 
