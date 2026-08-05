@@ -42,10 +42,14 @@ OUT_ROOT_NAME = "_phone-ready"
 # Folder names skipped everywhere, matched case-insensitively as substrings.
 DEFAULT_EXCLUDE_SUBSTRINGS = ["do not include", "do not use"]
 
-TONEMAP_CHAIN = (
+TONEMAP_ZSCALE = (
     "zscale=transfer=linear:npl=100,format=gbrpf32le,"
     "zscale=primaries=bt709,tonemap=hable:desat=0,"
     "zscale=transfer=bt709:matrix=bt709:range=tv,format=yuv420p"
+)
+TONEMAP_PLACEBO = (
+    "libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:"
+    "color_trc=bt709:range=tv:format=yuv420p"
 )
 
 # ---------------------------------------------------------------- utilities
@@ -341,23 +345,32 @@ def vf_chain(meta, mode, lut=None):
     parts = []
     tonemapped = False
     if meta.hdr:
-        if "zscale" in ff_caps()["filters"]:
-            parts.append(TONEMAP_CHAIN)
+        filters = ff_caps()["filters"]
+        if "zscale" in filters:
+            parts.append(TONEMAP_ZSCALE)
+            tonemapped = True
+        elif "libplacebo" in filters:
+            parts.append(TONEMAP_PLACEBO)
             tonemapped = True
         else:
             print(
-                "warn: %s is HDR but this ffmpeg lacks zscale, colors may look off"
-                % meta.rel,
+                "warn: %s is HDR and this ffmpeg lacks zscale/libplacebo, "
+                "keeping HDR as-is" % meta.rel,
                 file=sys.stderr,
             )
     if lut:
         parts.append("lut3d=file='%s'" % escape_filter_path(lut))
     portrait = meta.height > meta.width
     if mode == "h":
-        parts.append("scale=min(1920\\,iw):-2")
+        # For portrait sources the "phone-ready" target is 1080 wide,
+        # not 1920 wide, otherwise a 9:16 source becomes 1920x3414.
+        if portrait:
+            parts.append("scale=min(1080\\,iw):-2")
+        else:
+            parts.append("scale=min(1920\\,iw):-2")
     else:  # vertical 9:16
         if portrait:
-            parts.append("scale=-2:min(1920\\,ih)")
+            parts.append("scale=min(1080\\,iw):-2")
         else:
             parts.append("crop=trunc(ih*9/32)*2:ih,scale=1080:1920")
     parts.append("setsar=1")
@@ -388,7 +401,16 @@ def transcode(meta, out_path, mode, opts, start=None, dur=None):
             "-color_primaries", "bt709",
             "-color_trc", "bt709",
         ]
-    cmd += ["-map_metadata", "0", "-movflags", "+faststart", "-f", "mp4"]
+        # videotoolbox ignores the flags above, so stamp bt709 into the
+        # bitstream VUI directly. x264/x265 honor the flags and skip this.
+        if opts.encoder_name == "hevc_videotoolbox":
+            cmd += ["-bsf:v", "hevc_metadata=colour_primaries=1:"
+                    "transfer_characteristics=1:matrix_coefficients=1"]
+        elif opts.encoder_name == "h264_videotoolbox":
+            cmd += ["-bsf:v", "h264_metadata=colour_primaries=1:"
+                    "transfer_characteristics=1:matrix_coefficients=1"]
+    cmd += ["-map_metadata", "0", "-write_tmcd", "0",
+            "-movflags", "+faststart", "-f", "mp4"]
     tmp = out_path.with_name(out_path.name + ".part")
     cmd += [str(tmp)]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -623,6 +645,7 @@ def sample_evenly(items, cap):
 def cmd_clips(opts):
     videos = find_videos(opts.root, opts.exclude)
     metas = probe_all(videos, opts.root)
+    metas = [m for m in metas if m.duration >= opts.min_source]
     if not metas:
         die("no videos found under %s" % opts.root)
     dest = out_root(opts) / "_clips"
@@ -721,6 +744,7 @@ def thumb_jpeg(meta, at, width):
 def cmd_sheet(opts):
     videos = find_videos(opts.root, opts.exclude)
     metas = probe_all(videos, opts.root)
+    metas = [m for m in metas if m.duration >= opts.min_source]
     if not metas:
         die("no videos found under %s" % opts.root)
     out_path = (
@@ -924,9 +948,13 @@ def main(argv=None):
                     help="cap clips per video, 0 = no cap (default 15)")
     sp.add_argument("--copy", action="store_true",
                     help="stream-copy original quality, keyframe-aligned cuts")
+    sp.add_argument("--min-source", type=float, default=0.0,
+                    help="only auto-cut videos at least this many seconds long")
 
     sp = sub.add_parser("sheet", help="HTML contact sheet for picking moments")
     add_common(sp)
+    sp.add_argument("--min-source", type=float, default=0.0,
+                    help="only sheet videos at least this many seconds long")
     sp.add_argument("--thumbs", type=int, default=10,
                     help="max thumbnails per video (default 10)")
     sp.add_argument("--width", type=int, default=320,
