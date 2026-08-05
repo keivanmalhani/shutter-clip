@@ -691,19 +691,27 @@ def cmd_mirror(opts):
     skipped = len(metas) * len(modes) - len(jobs)
     print("mirror: %d to convert, %d already fresh, encoder %s"
           % (len(jobs), skipped, opts.encoder_name))
-    done_bytes = 0
-    for i, (m, mode, out) in enumerate(jobs, 1):
+    done_bytes = [0]
+    lock = threading.Lock()
+
+    def mirror_one(args):
+        i, (m, mode, out) = args
         try:
             secs = transcode(m, out, mode, opts)
         except RuntimeError as exc:
-            print("FAIL %s (%s)" % (m.rel, exc), file=sys.stderr)
-            continue
+            with lock:
+                print("FAIL %s (%s)" % (m.rel, exc), file=sys.stderr)
+            return
         size = out.stat().st_size
-        done_bytes += size
-        print("[%d/%d] %s -> %s  (%s, %.1fx realtime)"
-              % (i, len(jobs), m.rel, out.name, fmt_size(size),
-                 (m.duration or 0) / max(secs, 0.01)))
-    print("done. outputs in: %s  (%s new)" % (dest, fmt_size(done_bytes)))
+        with lock:
+            done_bytes[0] += size
+            print("[%d/%d] %s -> %s  (%s, %.1fx realtime)"
+                  % (i, len(jobs), m.rel, out.name, fmt_size(size),
+                     (m.duration or 0) / max(secs, 0.01)))
+
+    with ThreadPoolExecutor(max_workers=max(1, opts.encode_workers)) as ex:
+        list(ex.map(mirror_one, enumerate(jobs, 1)))
+    print("done. outputs in: %s  (%s new)" % (dest, fmt_size(done_bytes[0])))
 
 
 # ---------------------------------------------------------------- publish
@@ -847,6 +855,10 @@ def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks,
                 w *= edge_weight
             if lscore < 0.3 * med_luma:
                 w *= 0.4
+            # Absolute darkness floor: a uniformly dark file has a dark
+            # median too, so the relative rule alone lets night duds win.
+            if lscore < 32.0 * (2 ** (meta.bits - 8)):
+                w *= 0.15
             candidates.append((s, length, mscore * w))
     candidates.sort(key=lambda c: -c[2])
     picks = []
@@ -1120,7 +1132,6 @@ def cmd_publish(opts):
     cache.save()
 
     total_out = 0
-    folder_windows = {}
     plan = []
     for m, series, used_fast in analyzed:
         bucket = content_bucket(m)
@@ -1140,47 +1151,103 @@ def cmd_publish(opts):
             picks = [(0.0, min(m.duration, t_len), 0.0)]
         if not picks:
             continue
+        plan.append([m, bucket, picks])
+
+    # Cross-folder dedupe: the same source file re-copied into several
+    # folders yields identical picks. Claim each (stem, second) once,
+    # graded folders win: master > original > plain > insta > copy.
+    def folder_priority(name):
+        f = name.lower()
+        if "master" in f:
+            return 0
+        if "original" in f:
+            return 1
+        if "insta version" in f:
+            return 3
+        if "copy" in f:
+            return 4
+        return 2
+
+    def norm_stem(m):
+        return re.sub(r"-\d+$", "", Path(m.rel).stem.upper())
+
+    claimed = {}
+    dropped = 0
+    for item in sorted(plan, key=lambda it: folder_priority(top_folder(it[0]))):
+        m, bucket, picks = item
+        folder = top_folder(m)
+        kept = []
+        for pk in picks:
+            key = (norm_stem(m), int(round(pk[0])))
+            owner = claimed.setdefault(key, folder)
+            if owner == folder:
+                kept.append(pk)
+            else:
+                dropped += 1
+        item[2] = kept
+    plan = [it for it in plan if it[2]]
+    if dropped:
+        print("dedupe: skipped %d duplicate picks from copy folders" % dropped)
+
+    folder_windows = {}
+    for m, bucket, picks in plan:
         for start, length, score in picks[:2]:
             folder_windows.setdefault(top_folder(m), []).append(
                 (score, m, start, length)
             )
-        plan.append((m, bucket, picks))
     print("encode plan: %d videos, %d picks"
           % (len(plan), sum(len(p) for _, _, p in plan)))
 
-    for pi, (m, bucket, picks) in enumerate(plan, 1):
-        print("[%d/%d] %s: %d picks (%s)"
-              % (pi, len(plan), m.rel, len(picks), bucket))
+    print_lock = threading.Lock()
+
+    def encode_item(args):
+        pi, (m, bucket, picks) = args
+        with print_lock:
+            print("[%d/%d] %s: %d picks (%s)"
+                  % (pi, len(plan), m.rel, len(picks), bucket))
+        made = 0
         portrait = m.height > m.width
         for k, (start, length, _score) in enumerate(picks, 1):
             if portrait:
                 # Already vertical: one encode, a copy in each pack.
                 name = nice_pick_name(m, k, len(picks), start, length, "v")
+                if (dest / "b-sides" / name).exists():
+                    continue  # curated away, stays away
                 first = dest / PLATFORM_DIR["h"] / bucket / name
                 second = dest / PLATFORM_DIR["v"] / bucket / name
                 if opts.force or not fresh(first, m.path):
                     try:
                         transcode(m, first, "h", opts, start=start, dur=length)
-                        total_out += 1
+                        made += 1
                     except RuntimeError as exc:
-                        print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
-                              file=sys.stderr)
+                        with print_lock:
+                            print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
+                                  file=sys.stderr)
                         continue
                 if first.exists() and (opts.force or not fresh(second, m.path)):
                     second.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(first, second)
                 continue
             for mode in modes:
-                out = (dest / PLATFORM_DIR[mode] / bucket /
-                       nice_pick_name(m, k, len(picks), start, length, mode))
+                name = nice_pick_name(m, k, len(picks), start, length, mode)
+                if (dest / "b-sides" / name).exists():
+                    continue  # curated away, stays away
+                out = dest / PLATFORM_DIR[mode] / bucket / name
                 if not opts.force and fresh(out, m.path):
                     continue
                 try:
                     transcode(m, out, mode, opts, start=start, dur=length)
-                    total_out += 1
+                    made += 1
                 except RuntimeError as exc:
-                    print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
-                          file=sys.stderr)
+                    with print_lock:
+                        print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
+                              file=sys.stderr)
+        return made
+
+    workers = max(1, opts.encode_workers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for made in ex.map(encode_item, enumerate(plan, 1)):
+            total_out += made
 
     if opts.montage_len > 0:
         want = max(3, int(round(opts.montage_len / opts.montage_seg)))
@@ -1550,6 +1617,8 @@ def cmd_frames(opts):
     next_id = max((int(k) for k in manifest), default=0) + 1
     made = 0
     for f in sorted(pack.rglob("*.mp4")):
+        if f.name.startswith("._"):
+            continue
         rel = str(f.relative_to(pack))
         if rel in known:
             continue
@@ -1630,6 +1699,8 @@ def add_common(sp, root=True):
                     help="speed preset for libx265/libx264 (default medium)")
     sp.add_argument("--lut", default=None,
                     help="apply a .cube LUT to every output (for log footage)")
+    sp.add_argument("--encode-workers", type=int, default=2,
+                    help="parallel encodes on the hardware encoder (default 2)")
     sp.add_argument("-V", "--vertical", action="store_true",
                     help="also produce a 1080x1920 vertical center crop")
     sp.add_argument("--vertical-only", action="store_true",
