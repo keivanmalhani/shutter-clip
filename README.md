@@ -33,9 +33,12 @@ skipped, plus anything passed via `--exclude`.
 | `scan` | inventory: codec, resolution, fps, duration, HDR / 10-bit / flat-profile / no-audio flags |
 | `mirror` | 1080p phone-ready copy of every clip into `_phone-ready/library/`. Incremental |
 | `publish` | motion-ranked best moments from long videos, readable names, organized into platform packs by content type |
+| `rank` | deep-rank moments using shutter-select's analysis: speech, audio quality, sharpness, motion, exposure |
 | `clips` | plain auto-cut into 6-18 s pieces at scene changes (dumb version of publish) |
 | `sheet` | self-contained HTML contact sheet. Click frames to build a picks list |
 | `cut` | export the exact moments listed in a picks file |
+| `frames` | 3-frame review strips for every published pick, numbered for quick verdicts |
+| `curate` | apply `0012 kill` / `0007 top 3` verdicts: b-sides out, top picks front |
 
 ## publish
 
@@ -58,6 +61,38 @@ _phone-ready/post-ready/
 
 Content type comes from filename patterns (DJI = drone, DSCF/C0xxx =
 camera, IMG = phone) with folder-name fallback.
+
+## rank
+
+`publish` sees motion and brightness. `rank` sees everything
+[shutter-select](https://github.com/keivanmalhani/shutter-select) can
+measure: speech takes and what was said, audio quality, sharpness,
+exposure, motion, optional face presence. shutter-clip stays
+stdlib-only: it never imports shutter-select, it reads the per-file
+analysis JSON (schema 1) that `shutter-select analyze` caches under
+`_selects/cache/`, and `--analyze` runs that CLI as a subprocess when
+the cache is missing or stale.
+
+```zsh
+python3 shutter_clip.py rank "/Volumes/Crucial X10" --analyze
+```
+
+Segments are re-scored with social weights (motion and hook energy
+count for more than interview polish), percentile-ranked within their
+class across the whole run, and windowed to postable lengths per
+content type (drone 20 s, camera 12 s, phone 8 s, `--clip-len`
+overrides). Distorted or inaudible speech and sub-`--min-len` scraps
+are excluded with plain-English reasons. Everything lands in
+`_phone-ready/rank/`:
+
+- `picks.txt`: best moments first, ready for the cut command:
+  `python3 shutter_clip.py cut _phone-ready/rank/picks.txt ROOT`
+- `report.txt`: the full ranking plus every exclusion and its reason
+- `ranking.json`: scores, features, and transcripts for every segment,
+  the input for the caption and scheduling phases
+
+If shutter-select is not installed, `rank` says so and prints the exact
+analyze command to run; nothing is downloaded or imported silently.
 
 ## Output format
 
