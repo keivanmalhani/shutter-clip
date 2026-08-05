@@ -942,20 +942,65 @@ def montage_out(dest, mode, folder, seconds):
     return dest / PLATFORM_DIR[mode] / "montages" / name
 
 
+def title_card(text, canvas, opts, meta, out_path, tmpdir):
+    """1.2s black title card. Needs drawtext; returns False if absent."""
+    if "drawtext" not in ff_caps()["filters"]:
+        return False
+    txt = tmpdir / "title.txt"
+    txt.write_text(text, encoding="utf-8")
+    vf = (
+        "drawtext=textfile='%s':fontcolor=white:fontsize=%d:"
+        "x=(w-text_w)/2:y=(h-text_h)/2,format=yuv420p"
+        % (escape_filter_path(txt), canvas[1] // 16)
+    )
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "lavfi",
+        "-i", "color=c=black:size=%dx%d:rate=30:duration=1.2"
+              % (canvas[0], canvas[1]),
+        "-vf", vf,
+    ]
+    cmd += encoder_video_args(
+        opts.encoder_name, meta, True, opts.bitrate, opts.crf, opts.preset
+    )
+    cmd += ["-an", "-colorspace", "bt709", "-color_primaries", "bt709",
+            "-color_trc", "bt709", "-movflags", "+faststart", "-f", "mp4",
+            str(out_path)]
+    try:
+        run(cmd)
+        return True
+    except RuntimeError as exc:
+        print("warn: title card failed (%s)" % exc, file=sys.stderr)
+        return False
+
+
 def build_montage(folder, windows, mode, opts, dest, base):
-    """windows: [(meta, start)] chronological. Concat 5s segments."""
+    """windows: [(meta, start)] chronological. Concat 5s segments.
+
+    Loop-close appends a 2.5s reprise of the opening shot so the video
+    lands back where it started and loops cleanly on TikTok.
+    """
     canvas = (1920, 1080) if mode == "h" else (1080, 1920)
     seg_len = opts.montage_seg
-    out = montage_out(dest, mode, folder, seg_len * len(windows))
+    segs = [(m, start, seg_len) for m, start in windows]
+    total = seg_len * len(windows)
+    if getattr(opts, "loop_close", True) and windows:
+        segs.append((windows[0][0], windows[0][1], 2.5))
+        total += 2.5
+    out = montage_out(dest, mode, folder, total)
     if not opts.force and out.exists():
         return False
     tmpdir = base / ".tmp-montage" / re.sub(r"[^A-Za-z0-9]+", "-", folder + mode)
     tmpdir.mkdir(parents=True, exist_ok=True)
     seg_paths = []
     try:
-        for i, (m, start) in enumerate(windows):
+        if getattr(opts, "title_cards", False):
+            card = tmpdir / "seg_card.mp4"
+            if title_card(folder, canvas, opts, windows[0][0], card, tmpdir):
+                seg_paths.append(card)
+        for i, (m, start, dur) in enumerate(segs):
             seg = tmpdir / ("seg%02d.mp4" % i)
-            transcode(m, seg, mode, opts, start=start, dur=seg_len,
+            transcode(m, seg, mode, opts, start=start, dur=dur,
                       canvas=canvas, no_audio=True)
             seg_paths.append(seg)
         lst = tmpdir / "list.txt"
@@ -1599,6 +1644,11 @@ def main(argv=None):
                     help="target seconds per folder montage, 0 disables")
     sp.add_argument("--montage-seg", type=float, default=5.0,
                     help="seconds per montage cut (default 5)")
+    sp.add_argument("--no-loop-close", dest="loop_close",
+                    action="store_false", default=True,
+                    help="skip the 2.5s reprise of the opening shot")
+    sp.add_argument("--title-cards", action="store_true",
+                    help="1.2s trip title card at montage start")
     sp.add_argument("--force", action="store_true",
                     help="re-encode even if the output is fresh")
 
