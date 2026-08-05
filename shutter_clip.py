@@ -283,12 +283,14 @@ class Cache:
                 f: getattr(meta, f) for f in META_FIELDS
             }
 
-    def get_profile(self, key):
-        return self.data["profile"].get(key)
+    def get_profile(self, key, fast=False):
+        space = "profile_fast" if fast else "profile"
+        return self.data.setdefault(space, {}).get(key)
 
-    def put_profile(self, key, series):
+    def put_profile(self, key, series, fast=False):
+        space = "profile_fast" if fast else "profile"
         with self.lock:
-            self.data["profile"][key] = [
+            self.data.setdefault(space, {})[key] = [
                 [round(x, 3) for x in series[0]],
                 [round(x, 4) for x in series[1]],
                 [round(x, 2) for x in series[2]],
@@ -728,11 +730,19 @@ def content_bucket(meta):
     return "camera footage"
 
 
-def motion_profile(meta, use_hwaccel=True):
-    """One decode pass. Returns list of (t, scene_score, yavg) per frame."""
+def motion_profile(meta, use_hwaccel=True, fast=False):
+    """One decode pass. Returns list of (t, scene_score, yavg) per frame.
+
+    fast=True decodes keyframes only (-skip_frame nokey): ~1-2 samples
+    per second instead of every frame, an order of magnitude faster on
+    4K sources. Scene scores ride higher because frames are further
+    apart; pick_windows compensates on the cut threshold.
+    """
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     if use_hwaccel:
         cmd += ["-hwaccel", "videotoolbox"]
+    if fast:
+        cmd += ["-skip_frame", "nokey"]
     cmd += [
         "-i", str(meta.path), "-map", "0:%d" % meta.vindex,
         "-vf",
@@ -744,7 +754,7 @@ def motion_profile(meta, use_hwaccel=True):
         p = run(cmd)
     except RuntimeError:
         if use_hwaccel:
-            return motion_profile(meta, use_hwaccel=False)
+            return motion_profile(meta, use_hwaccel=False, fast=fast)
         raise
     frames = []
     t = scene = yavg = None
@@ -786,7 +796,8 @@ def bin_series(frames, duration, step=0.5):
     return times, motion, luma
 
 
-def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks):
+def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks,
+                 edge_weight=0.6):
     """Rank candidate windows by motion, mid-file bias, dark penalty.
 
     series is (times, motion, luma) from bin_series or the cache.
@@ -796,6 +807,11 @@ def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks):
     times, motion, luma = series
     if not times:
         return []
+    if len(motion) > 4:
+        # First samples after a decoder start can carry a garbage-high
+        # scene score; clamp them so takeoff frames never win on noise.
+        med = sorted(motion)[len(motion) // 2]
+        motion = [min(x, med * 3) for x in motion[:2]] + list(motion[2:])
     step = times[1] - times[0] if len(times) > 1 else 0.5
     med_luma = sorted(luma)[len(luma) // 2] or 1.0
 
@@ -828,7 +844,7 @@ def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks):
             lscore = sum(luma[i] for i in idx) / len(idx)
             w = 1.0
             if s < edge or (s + length) > dur - edge:
-                w *= 0.6
+                w *= edge_weight
             if lscore < 0.3 * med_luma:
                 w *= 0.4
             candidates.append((s, length, mscore * w))
@@ -1063,30 +1079,41 @@ def cmd_publish(opts):
     (dest).mkdir(parents=True, exist_ok=True)
     (dest / "WHY.txt").write_text(WHY_TXT, encoding="utf-8")
 
+    fast = not opts.full_analysis
+
     def analyze_one(m):
         try:
             key = Cache.key(m.path, opts.root)
-            series = cache.get_profile(key)
+            full = cache.get_profile(key, False)
+            if full is not None:
+                # A full-decode profile is strictly better; use it if
+                # any previous run already paid for it.
+                return m, full, None, False
+            series = cache.get_profile(key, fast)
             if series is None:
-                cache.put_profile(key, bin_series(motion_profile(m), m.duration))
+                cache.put_profile(
+                    key,
+                    bin_series(motion_profile(m, fast=fast), m.duration),
+                    fast,
+                )
                 # Read back so fresh and cached runs see identical
                 # rounded values and pick identical windows.
-                series = cache.get_profile(key)
-            return m, series, None
+                series = cache.get_profile(key, fast)
+            return m, series, None, fast
         except (RuntimeError, OSError) as exc:
-            return m, None, exc
+            return m, None, exc, fast
 
     analyzed = []
     done_n = 0
     print("analyzing %d candidates, %d workers"
           % (len(candidates), opts.workers))
     with ThreadPoolExecutor(max_workers=opts.workers) as ex:
-        for m, series, err in ex.map(analyze_one, candidates):
+        for m, series, err, used_fast in ex.map(analyze_one, candidates):
             done_n += 1
             if err is not None:
                 print("FAIL analyze %s (%s)" % (m.rel, err), file=sys.stderr)
                 continue
-            analyzed.append((m, series))
+            analyzed.append((m, series, used_fast))
             if done_n % 20 == 0:
                 print("analyzed %d/%d" % (done_n, len(candidates)))
                 cache.save()
@@ -1095,13 +1122,20 @@ def cmd_publish(opts):
     total_out = 0
     folder_windows = {}
     plan = []
-    for m, series in analyzed:
+    for m, series, used_fast in analyzed:
         bucket = content_bucket(m)
         t_len = opts.target_len or BUCKET_TARGET.get(bucket, 14.0)
         cap = n_picks_for(m.duration) if opts.max_picks == 0 else opts.max_picks
         if m.duration < opts.min_source:
             cap = 1
-        picks = pick_windows(m, series, t_len, opts.min_len, opts.scene, cap)
+        # Keyframe-sampled scores ride higher, so hard cuts need a
+        # higher bar in fast mode.
+        thr = opts.scene if not used_fast else max(opts.scene, 0.55)
+        # Keyframe sampling over-rewards takeoff/landing churn, so damp
+        # the file edges harder in fast mode.
+        edge_w = 0.6 if not used_fast else 0.35
+        picks = pick_windows(m, series, t_len, opts.min_len, thr, cap,
+                             edge_weight=edge_w)
         if not picks and m.duration >= opts.min_len:
             picks = [(0.0, min(m.duration, t_len), 0.0)]
         if not picks:
@@ -1632,6 +1666,9 @@ def main(argv=None):
                          "camera 12, phone 8")
     sp.add_argument("--workers", type=int, default=3,
                     help="parallel analysis decodes (default 3)")
+    sp.add_argument("--full-analysis", action="store_true",
+                    help="decode every frame for scoring instead of "
+                         "keyframes only (slower, marginally finer)")
     sp.add_argument("--min-len", type=float, default=6.0,
                     help="shortest usable clip seconds (default 6)")
     sp.add_argument("--scene", type=float, default=0.35,
