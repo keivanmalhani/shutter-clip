@@ -499,7 +499,7 @@ def vf_chain(meta, mode, lut=None, canvas=None):
 
 
 def transcode(meta, out_path, mode, opts, start=None, dur=None,
-              canvas=None, no_audio=False):
+              canvas=None, no_audio=False, hwaccel=True):
     """Encode one output file. Returns seconds elapsed."""
     chain, tonemapped = vf_chain(meta, mode, opts.lut, canvas)
     enc_args = encoder_video_args(
@@ -507,6 +507,12 @@ def transcode(meta, out_path, mode, opts, start=None, dur=None,
         opts.bitrate, opts.crf, opts.preset
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    # Hardware decode. Without -hwaccel_output_format frames land back
+    # in system memory, so the normal filter chain still applies.
+    # Software decode of 4K 10-bit pins every core: measured 2.7
+    # files/min vs 21 files/min on the M3 Pro.
+    if hwaccel and not getattr(opts, "no_hwaccel", False):
+        cmd += ["-hwaccel", "videotoolbox"]
     if start is not None:
         cmd += ["-ss", "%.3f" % start]
     cmd += ["-i", str(meta.path)]
@@ -542,7 +548,15 @@ def transcode(meta, out_path, mode, opts, start=None, dur=None,
         run(cmd)
     except RuntimeError:
         if tmp.exists():
-            tmp.unlink()
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        if hwaccel and not getattr(opts, "no_hwaccel", False):
+            # Some codecs/profiles have no hardware decoder. Fall back.
+            return transcode(meta, out_path, mode, opts, start=start,
+                             dur=dur, canvas=canvas, no_audio=no_audio,
+                             hwaccel=False)
         raise
     os.replace(tmp, out_path)
     return time.time() - t0
@@ -2134,6 +2148,8 @@ def add_common(sp, root=True):
                     help="speed preset for libx265/libx264 (default medium)")
     sp.add_argument("--lut", default=None,
                     help="apply a .cube LUT to every output (for log footage)")
+    sp.add_argument("--no-hwaccel", action="store_true",
+                    help="software decode only, use if playback is odd")
     sp.add_argument("--encode-workers", type=int, default=2,
                     help="parallel encodes on the hardware encoder (default 2)")
     sp.add_argument("-V", "--vertical", action="store_true",
