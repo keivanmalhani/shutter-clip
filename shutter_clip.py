@@ -5,11 +5,13 @@ Point it at a drive or folder of camera originals. It inventories, converts,
 auto-cuts, and exports phone-ready files you can AirDrop and post as-is.
 
 Subcommands:
-  scan    inventory every video: codec, resolution, fps, duration, flags
-  mirror  phone-ready 1080p copy of every clip into _phone-ready/
-  clips   auto-cut every video into short pieces via scene detection
-  sheet   build a self-contained HTML contact sheet for picking moments
-  cut     export exact moments listed in a picks file
+  scan     inventory every video: codec, resolution, fps, duration, flags
+  mirror   phone-ready 1080p copy of every clip into _phone-ready/library/
+  publish  motion-ranked best moments, named readably and organized into
+           platform packs (tiktok + reels, shorts + stories) by content type
+  clips    plain auto-cut into short pieces via scene detection
+  sheet    build a self-contained HTML contact sheet for picking moments
+  cut      export exact moments listed in a picks file
 
 Design rules:
   - Horizontal 1920x1080 is the default output. Vertical 1080x1920 center
@@ -562,7 +564,7 @@ def cmd_mirror(opts):
     metas = probe_all(videos, opts.root)
     if not metas:
         die("no videos found under %s" % opts.root)
-    dest = out_root(opts)
+    dest = out_root(opts) / "library"
     modes = modes_for(opts)
     jobs = []
     for m in metas:
@@ -587,6 +589,255 @@ def cmd_mirror(opts):
               % (i, len(jobs), m.rel, out.name, fmt_size(size),
                  (m.duration or 0) / max(secs, 0.01)))
     print("done. outputs in: %s  (%s new)" % (dest, fmt_size(done_bytes)))
+
+
+# ---------------------------------------------------------------- publish
+
+
+CAM_BUCKETS = (
+    (re.compile(r"^DJI[_-]", re.I), "drone aerials"),
+    (re.compile(r"^(DSCF|FUJI)", re.I), "camera footage"),
+    (re.compile(r"^C\d{4}", re.I), "camera footage"),
+    (re.compile(r"^IMG[_E-]", re.I), "phone clips"),
+)
+
+
+def content_bucket(meta):
+    stem = Path(meta.rel).name
+    for pat, bucket in CAM_BUCKETS:
+        if pat.match(stem):
+            return bucket
+    top = Path(meta.rel).parts[0].lower() if len(Path(meta.rel).parts) > 1 else ""
+    if "drone" in top:
+        return "drone aerials"
+    if "iphone" in top or "phone" in top:
+        return "phone clips"
+    return "camera footage"
+
+
+def motion_profile(meta, use_hwaccel=True):
+    """One decode pass. Returns list of (t, scene_score, yavg) per frame."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if use_hwaccel:
+        cmd += ["-hwaccel", "videotoolbox"]
+    cmd += [
+        "-i", str(meta.path), "-map", "0:%d" % meta.vindex,
+        "-vf",
+        "scale=160:-2,select=gte(scene\\,0),signalstats,"
+        "metadata=mode=print:file=-",
+        "-an", "-f", "null", "-",
+    ]
+    try:
+        p = run(cmd)
+    except RuntimeError:
+        if use_hwaccel:
+            return motion_profile(meta, use_hwaccel=False)
+        raise
+    frames = []
+    t = scene = yavg = None
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        mm = re.search(r"pts_time:([\d.]+)", line)
+        if mm:
+            if t is not None and scene is not None:
+                frames.append((t, scene, yavg if yavg is not None else 0.0))
+            t, scene, yavg = float(mm.group(1)), None, None
+            continue
+        mm = re.search(r"lavfi\.scene_score=([\d.]+)", line)
+        if mm:
+            scene = float(mm.group(1))
+            continue
+        mm = re.search(r"lavfi\.signalstats\.YAVG=([\d.]+)", line)
+        if mm:
+            yavg = float(mm.group(1))
+    if t is not None and scene is not None:
+        frames.append((t, scene, yavg if yavg is not None else 0.0))
+    return frames
+
+
+def bin_series(frames, duration, step=0.5):
+    """Average per time bin. Returns (times, motion, luma) parallel lists."""
+    nbins = max(1, int(duration / step))
+    acc = [[0.0, 0.0, 0] for _ in range(nbins)]
+    for t, scene, yavg in frames:
+        i = min(nbins - 1, int(t / step))
+        acc[i][0] += scene
+        acc[i][1] += yavg
+        acc[i][2] += 1
+    times, motion, luma = [], [], []
+    for i, (s, y, n) in enumerate(acc):
+        if n == 0:
+            continue
+        times.append(i * step)
+        motion.append(s / n)
+        luma.append(y / n)
+    return times, motion, luma
+
+
+def pick_windows(meta, frames, target_len, min_len, cut_thr, max_picks):
+    """Rank candidate windows by motion, mid-file bias, dark penalty.
+
+    Returns [(start, length, score)] non-overlapping, best first.
+    """
+    dur = meta.duration
+    times, motion, luma = bin_series(frames, dur)
+    if not times:
+        return []
+    step = times[1] - times[0] if len(times) > 1 else 0.5
+    med_luma = sorted(luma)[len(luma) // 2] or 1.0
+
+    # Segment boundaries at hard cuts so picks never straddle a cut.
+    bounds = [0.0]
+    for t, m in zip(times, motion):
+        if m >= cut_thr and t - bounds[-1] > 1.0:
+            bounds.append(t)
+    bounds.append(dur)
+
+    edge = max(3.0, dur * 0.08)
+    candidates = []
+    for a, b in zip(bounds, bounds[1:]):
+        seg_len = b - a
+        if seg_len < min_len:
+            continue
+        length = min(target_len, seg_len)
+        starts = []
+        s = a
+        while s + length <= b + 0.01:
+            starts.append(s)
+            s += 1.0
+        if not starts:
+            starts = [a]
+        for s in starts:
+            idx = [i for i, t in enumerate(times) if s <= t < s + length]
+            if not idx:
+                continue
+            mscore = sum(motion[i] for i in idx) / len(idx)
+            lscore = sum(luma[i] for i in idx) / len(idx)
+            w = 1.0
+            if s < edge or (s + length) > dur - edge:
+                w *= 0.6
+            if lscore < 0.3 * med_luma:
+                w *= 0.4
+            candidates.append((s, length, mscore * w))
+    candidates.sort(key=lambda c: -c[2])
+    picks = []
+    for s, length, score in candidates:
+        if len(picks) >= max_picks:
+            break
+        if any(s < ps + pl + 2.0 and ps < s + length + 2.0 for ps, pl, _ in picks):
+            continue
+        picks.append((s, length, score))
+    picks.sort(key=lambda p: p[0])
+    return picks
+
+
+def n_picks_for(duration):
+    if duration < 75:
+        return 1
+    if duration < 180:
+        return 2
+    if duration < 360:
+        return 3
+    return 4
+
+
+def nice_pick_name(meta, k, total, start, length, mode):
+    trip = Path(meta.rel).parts[0].strip() if len(Path(meta.rel).parts) > 1 \
+        else meta.path.parent.name.strip()
+    stem = Path(meta.rel).stem
+    mins, secs = int(start) // 60, int(start) % 60
+    orient = "horizontal" if mode == "h" else "vertical"
+    name = "%s - pick %d of %d - %ds - %s at %dm%02ds - %s.mp4" % (
+        trip, k, total, round(length), stem, mins, secs, orient
+    )
+    # exFAT-safe: strip characters that break on camera drives
+    return re.sub(r'[:*?"<>|/\\]', "-", name)
+
+
+PLATFORM_DIR = {"h": "tiktok + reels", "v": "shorts + stories - vertical"}
+
+PHONE_READY_README = """\
+WHAT IS IN THIS FOLDER
+======================
+
+post-ready/
+    Finished clips, ready to AirDrop and post. Nothing needs editing.
+    tiktok + reels/            horizontal picks, grouped by content type
+    shorts + stories - vertical/  the same moments as 9:16 vertical crops
+    Names read: trip - pick 2 of 3 - 14s - DJI_0603 at 3m10s - horizontal
+    That means: 14 second clip, taken 3m10s into DJI_0603, second-best
+    of three picks from that video.
+
+library/
+    Every original converted once to phone-friendly 1080p, same folder
+    layout as the drive. Grab full videos here.
+
+contact-sheet.html
+    Click frames of the long videos to hand-pick exact moments, copy the
+    list, and the cut command exports them.
+
+Originals are never touched. Everything in here can be regenerated.
+"""
+
+
+def cmd_publish(opts):
+    videos = find_videos(opts.root, opts.exclude)
+    metas = probe_all(videos, opts.root)
+    metas = [m for m in metas if m.duration >= opts.min_source]
+    if not metas:
+        die("no videos of %ds+ found under %s" % (opts.min_source, opts.root))
+    base = out_root(opts)
+    dest = base / "post-ready"
+    modes = ["h"] if opts.horizontal_only else ["h", "v"]
+    (base).mkdir(parents=True, exist_ok=True)
+    (base / "README.txt").write_text(PHONE_READY_README, encoding="utf-8")
+    total_out = 0
+    for fi, m in enumerate(metas, 1):
+        try:
+            frames = motion_profile(m)
+        except RuntimeError as exc:
+            print("FAIL analyze %s (%s)" % (m.rel, exc), file=sys.stderr)
+            continue
+        picks = pick_windows(
+            m, frames, opts.target_len, opts.min_len, opts.scene,
+            n_picks_for(m.duration) if opts.max_picks == 0 else opts.max_picks,
+        )
+        if not picks:
+            print("[%d/%d] %s: no usable window" % (fi, len(metas), m.rel))
+            continue
+        bucket = content_bucket(m)
+        print("[%d/%d] %s: %d picks (%s)"
+              % (fi, len(metas), m.rel, len(picks), bucket))
+        portrait = m.height > m.width
+        for k, (start, length, _score) in enumerate(picks, 1):
+            if portrait:
+                # Already vertical: one encode, a copy in each pack.
+                name = nice_pick_name(m, k, len(picks), start, length, "v")
+                first = dest / PLATFORM_DIR["h"] / bucket / name
+                second = dest / PLATFORM_DIR["v"] / bucket / name
+                if opts.force or not fresh(first, m.path):
+                    try:
+                        transcode(m, first, "h", opts, start=start, dur=length)
+                        total_out += 1
+                    except RuntimeError as exc:
+                        print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
+                              file=sys.stderr)
+                        continue
+                if first.exists() and (opts.force or not fresh(second, m.path)):
+                    second.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(first, second)
+                continue
+            for mode in modes:
+                out = (dest / PLATFORM_DIR[mode] / bucket /
+                       nice_pick_name(m, k, len(picks), start, length, mode))
+                if not opts.force and fresh(out, m.path):
+                    continue
+                try:
+                    transcode(m, out, mode, opts, start=start, dur=length)
+                    total_out += 1
+                except RuntimeError as exc:
+                    print("FAIL %s pick %d (%s)" % (m.rel, k, exc),
+                          file=sys.stderr)
+    print("done. %d clips in: %s" % (total_out, dest))
 
 
 # ---------------------------------------------------------------- clips
@@ -934,6 +1185,26 @@ def main(argv=None):
     sp.add_argument("--force", action="store_true",
                     help="re-encode even if the output is fresh")
 
+    sp = sub.add_parser(
+        "publish",
+        help="motion-ranked picks, organized by platform and content type",
+    )
+    add_common(sp)
+    sp.add_argument("--min-source", type=float, default=45.0,
+                    help="only pick from videos this long or longer (default 45)")
+    sp.add_argument("--target-len", type=float, default=14.0,
+                    help="preferred clip length seconds (default 14)")
+    sp.add_argument("--min-len", type=float, default=6.0,
+                    help="shortest usable clip seconds (default 6)")
+    sp.add_argument("--scene", type=float, default=0.35,
+                    help="hard-cut threshold, picks never straddle one")
+    sp.add_argument("--max-picks", type=int, default=0,
+                    help="picks per video, 0 = scale with duration (default)")
+    sp.add_argument("--horizontal-only", action="store_true",
+                    help="skip the vertical variants")
+    sp.add_argument("--force", action="store_true",
+                    help="re-encode even if the output is fresh")
+
     sp = sub.add_parser("clips", help="auto-cut videos into short pieces")
     add_common(sp)
     sp.add_argument("--min-len", type=float, default=6.0,
@@ -978,6 +1249,7 @@ def main(argv=None):
     {
         "scan": cmd_scan,
         "mirror": cmd_mirror,
+        "publish": cmd_publish,
         "clips": cmd_clips,
         "sheet": cmd_sheet,
         "cut": cmd_cut,

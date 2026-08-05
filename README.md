@@ -31,10 +31,33 @@ skipped, plus anything passed via `--exclude`.
 | command | what it does |
 | --- | --- |
 | `scan` | inventory: codec, resolution, fps, duration, HDR / 10-bit / flat-profile / no-audio flags |
-| `mirror` | 1080p phone-ready copy of every clip. Incremental: re-runs only convert new files |
-| `clips` | auto-cut every video into 6-18 s pieces at scene changes, interval fallback for continuous shots |
+| `mirror` | 1080p phone-ready copy of every clip into `_phone-ready/library/`. Incremental |
+| `publish` | motion-ranked best moments from long videos, readable names, organized into platform packs by content type |
+| `clips` | plain auto-cut into 6-18 s pieces at scene changes (dumb version of publish) |
 | `sheet` | self-contained HTML contact sheet. Click frames to build a picks list |
 | `cut` | export the exact moments listed in a picks file |
+
+## publish
+
+One analysis decode per video builds a motion profile (per-frame scene
+score plus average luma). Candidate windows are ranked by motion energy,
+down-weighted near the first/last 8 percent (drone takeoff/landing) and
+in dark stretches, and never straddle a hard cut. Top 1-4 non-overlapping
+moments per video (scales with duration) are exported horizontal plus a
+9:16 vertical twin:
+
+```text
+_phone-ready/post-ready/
+  tiktok + reels/
+    drone aerials/brazil drone footage - pick 1 of 2 - 14s - DJI_0596 at 1m00s - horizontal.mp4
+    camera footage/...
+    phone clips/...
+  shorts + stories - vertical/
+    ...same moments as vertical crops
+```
+
+Content type comes from filename patterns (DJI = drone, DSCF/C0xxx =
+camera, IMG = phone) with folder-name fallback.
 
 ## Output format
 
