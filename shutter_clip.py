@@ -36,7 +36,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mts", ".avi", ".mkv"}
@@ -227,6 +229,85 @@ def probe(path, root):
     return m
 
 
+# ---------------------------------------------------------------- cache
+
+
+META_FIELDS = (
+    "duration", "width", "height", "fps", "vcodec", "pix_fmt", "bits",
+    "hdr", "color_transfer", "audio_codec", "vindex", "aindex", "size",
+    "rotated",
+)
+
+
+class Cache:
+    """Probe + motion-profile cache so re-runs skip the expensive passes.
+
+    Lives at <out_root>/.shutter-cache.json. Keyed by rel|size|mtime so a
+    replaced or re-copied file re-probes automatically.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.data = {"version": 1, "probe": {}, "profile": {}}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if loaded.get("version") == 1:
+                self.data = loaded
+        except (OSError, ValueError):
+            pass
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(path, root):
+        st = Path(path).stat()
+        return "%s|%d|%d" % (
+            Path(path).relative_to(root), st.st_size, int(st.st_mtime)
+        )
+
+    def get_meta(self, key, path, root):
+        d = self.data["probe"].get(key)
+        if d is None:
+            return None
+        m = Meta()
+        m.path = Path(path)
+        m.rel = str(Path(path).relative_to(root))
+        for f in META_FIELDS:
+            setattr(m, f, d.get(f))
+        return m
+
+    def put_meta(self, key, meta):
+        with self.lock:
+            self.data["probe"][key] = {
+                f: getattr(meta, f) for f in META_FIELDS
+            }
+
+    def get_profile(self, key):
+        return self.data["profile"].get(key)
+
+    def put_profile(self, key, series):
+        with self.lock:
+            self.data["profile"][key] = [
+                [round(x, 3) for x in series[0]],
+                [round(x, 4) for x in series[1]],
+                [round(x, 2) for x in series[2]],
+            ]
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(self.data), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print("warn: cache save failed (%s)" % exc, file=sys.stderr)
+
+
+def open_cache(opts):
+    return Cache(out_root(opts) / ".shutter-cache.json")
+
+
 # ---------------------------------------------------------------- discovery
 
 
@@ -262,9 +343,21 @@ def find_videos(root, excludes):
     return found
 
 
-def probe_all(paths, root):
+def probe_all(paths, root, cache=None):
     metas = []
     for p in paths:
+        key = None
+        if cache is not None:
+            try:
+                key = Cache.key(p, root)
+            except OSError:
+                continue
+            m = cache.get_meta(key, p, root)
+            if m is not None:
+                cache.hits += 1
+                if m.duration and m.duration >= 0.5:
+                    metas.append(m)
+                continue
         try:
             m = probe(p, root)
         except (RuntimeError, json.JSONDecodeError) as exc:
@@ -273,7 +366,14 @@ def probe_all(paths, root):
         if m is None or m.duration is None or m.duration < 0.5:
             print("warn: skipping %s (no usable video)" % p.name, file=sys.stderr)
             continue
+        if cache is not None and key is not None:
+            cache.put_meta(key, m)
+            cache.misses += 1
         metas.append(m)
+    if cache is not None and cache.misses:
+        cache.save()
+    if cache is not None:
+        print("probe cache: %d hits, %d fresh" % (cache.hits, cache.misses))
     return metas
 
 
@@ -518,7 +618,7 @@ def looks_flat(meta):
 
 def cmd_scan(opts):
     videos = find_videos(opts.root, opts.exclude)
-    metas = probe_all(videos, opts.root)
+    metas = probe_all(videos, opts.root, open_cache(opts))
     if not metas:
         die("no videos found under %s" % opts.root)
     total_dur = 0.0
@@ -574,7 +674,7 @@ def fresh(out_path, src_path):
 
 def cmd_mirror(opts):
     videos = find_videos(opts.root, opts.exclude)
-    metas = probe_all(videos, opts.root)
+    metas = probe_all(videos, opts.root, open_cache(opts))
     if not metas:
         die("no videos found under %s" % opts.root)
     dest = out_root(opts) / "library"
@@ -686,13 +786,14 @@ def bin_series(frames, duration, step=0.5):
     return times, motion, luma
 
 
-def pick_windows(meta, frames, target_len, min_len, cut_thr, max_picks):
+def pick_windows(meta, series, target_len, min_len, cut_thr, max_picks):
     """Rank candidate windows by motion, mid-file bias, dark penalty.
 
+    series is (times, motion, luma) from bin_series or the cache.
     Returns [(start, length, score)] non-overlapping, best first.
     """
     dur = meta.duration
-    times, motion, luma = bin_series(frames, dur)
+    times, motion, luma = series
     if not times:
         return []
     step = times[1] - times[0] if len(times) > 1 else 0.5
@@ -895,9 +996,17 @@ def pick_candidates(metas, min_source):
     return chosen
 
 
+BUCKET_TARGET = {
+    "drone aerials": 20.0,
+    "camera footage": 12.0,
+    "phone clips": 8.0,
+}
+
+
 def cmd_publish(opts):
     videos = find_videos(opts.root, opts.exclude)
-    metas = probe_all(videos, opts.root)
+    cache = open_cache(opts)
+    metas = probe_all(videos, opts.root, cache)
     candidates = pick_candidates(metas, opts.min_source)
     if not candidates:
         die("no usable videos under %s" % opts.root)
@@ -908,32 +1017,61 @@ def cmd_publish(opts):
     (base / "README.txt").write_text(PHONE_READY_README, encoding="utf-8")
     (dest).mkdir(parents=True, exist_ok=True)
     (dest / "WHY.txt").write_text(WHY_TXT, encoding="utf-8")
+
+    def analyze_one(m):
+        try:
+            key = Cache.key(m.path, opts.root)
+            series = cache.get_profile(key)
+            if series is None:
+                cache.put_profile(key, bin_series(motion_profile(m), m.duration))
+                # Read back so fresh and cached runs see identical
+                # rounded values and pick identical windows.
+                series = cache.get_profile(key)
+            return m, series, None
+        except (RuntimeError, OSError) as exc:
+            return m, None, exc
+
+    analyzed = []
+    done_n = 0
+    print("analyzing %d candidates, %d workers"
+          % (len(candidates), opts.workers))
+    with ThreadPoolExecutor(max_workers=opts.workers) as ex:
+        for m, series, err in ex.map(analyze_one, candidates):
+            done_n += 1
+            if err is not None:
+                print("FAIL analyze %s (%s)" % (m.rel, err), file=sys.stderr)
+                continue
+            analyzed.append((m, series))
+            if done_n % 20 == 0:
+                print("analyzed %d/%d" % (done_n, len(candidates)))
+                cache.save()
+    cache.save()
+
     total_out = 0
     folder_windows = {}
-    for fi, m in enumerate(candidates, 1):
-        try:
-            frames = motion_profile(m)
-        except RuntimeError as exc:
-            print("FAIL analyze %s (%s)" % (m.rel, exc), file=sys.stderr)
-            continue
+    plan = []
+    for m, series in analyzed:
+        bucket = content_bucket(m)
+        t_len = opts.target_len or BUCKET_TARGET.get(bucket, 14.0)
         cap = n_picks_for(m.duration) if opts.max_picks == 0 else opts.max_picks
         if m.duration < opts.min_source:
             cap = 1
-        picks = pick_windows(
-            m, frames, opts.target_len, opts.min_len, opts.scene, cap,
-        )
+        picks = pick_windows(m, series, t_len, opts.min_len, opts.scene, cap)
         if not picks and m.duration >= opts.min_len:
-            picks = [(0.0, min(m.duration, opts.target_len), 0.0)]
+            picks = [(0.0, min(m.duration, t_len), 0.0)]
         if not picks:
-            print("[%d/%d] %s: no usable window" % (fi, len(candidates), m.rel))
             continue
         for start, length, score in picks[:2]:
             folder_windows.setdefault(top_folder(m), []).append(
                 (score, m, start, length)
             )
-        bucket = content_bucket(m)
+        plan.append((m, bucket, picks))
+    print("encode plan: %d videos, %d picks"
+          % (len(plan), sum(len(p) for _, _, p in plan)))
+
+    for pi, (m, bucket, picks) in enumerate(plan, 1):
         print("[%d/%d] %s: %d picks (%s)"
-              % (fi, len(candidates), m.rel, len(picks), bucket))
+              % (pi, len(plan), m.rel, len(picks), bucket))
         portrait = m.height > m.width
         for k, (start, length, _score) in enumerate(picks, 1):
             if portrait:
@@ -1157,7 +1295,7 @@ def thumb_jpeg(meta, at, width):
 
 def cmd_sheet(opts):
     videos = find_videos(opts.root, opts.exclude)
-    metas = probe_all(videos, opts.root)
+    metas = probe_all(videos, opts.root, open_cache(opts))
     metas = [m for m in metas if m.duration >= opts.min_source]
     if not metas:
         die("no videos found under %s" % opts.root)
@@ -1303,6 +1441,95 @@ def cmd_cut(opts):
     print("done. %d cuts in: %s" % (made, dest))
 
 
+# ---------------------------------------------------------------- frames / curate
+
+
+def h_pack(opts):
+    return out_root(opts) / "post-ready" / PLATFORM_DIR["h"]
+
+
+def twin_of(opts, h_path):
+    """The vertical twin of a horizontal pack file, if it exists."""
+    rel = h_path.relative_to(h_pack(opts))
+    name = rel.name.replace(" - horizontal.mp4", " - vertical.mp4")
+    return out_root(opts) / "post-ready" / PLATFORM_DIR["v"] / rel.parent / name
+
+
+def cmd_frames(opts):
+    pack = h_pack(opts)
+    if not pack.is_dir():
+        die("no horizontal pack yet, run publish first")
+    review = out_root(opts) / ".review"
+    review.mkdir(parents=True, exist_ok=True)
+    mpath = review / "manifest.json"
+    manifest = {}
+    try:
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    known = set(manifest.values())
+    next_id = max((int(k) for k in manifest), default=0) + 1
+    made = 0
+    for f in sorted(pack.rglob("*.mp4")):
+        rel = str(f.relative_to(pack))
+        if rel in known:
+            continue
+        fid = "%04d" % next_id
+        try:
+            run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-y", "-i", str(f),
+                "-vf", "select=eq(n\\,15)+eq(n\\,%d)+eq(n\\,%d),"
+                       "scale=420:-2,tile=3x1"
+                       % (30 * 6, 30 * 12),
+                "-frames:v", "1", str(review / (fid + ".jpg")),
+            ])
+        except RuntimeError as exc:
+            print("warn: strip failed for %s (%s)" % (rel, exc),
+                  file=sys.stderr)
+            continue
+        manifest[fid] = rel
+        next_id += 1
+        made += 1
+    mpath.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    print("frames: %d new strips, %d total -> %s" % (made, len(manifest), review))
+
+
+def cmd_curate(opts):
+    """Apply verdicts: '0012 kill' / '0007 top 3' / unlisted = keep."""
+    review = out_root(opts) / ".review"
+    manifest = json.loads((review / "manifest.json").read_text(encoding="utf-8"))
+    pack = h_pack(opts)
+    bsides = out_root(opts) / "post-ready" / "b-sides"
+    topdir = out_root(opts) / "post-ready" / "post first - top picks"
+    killed = topped = 0
+    for raw in Path(opts.verdicts).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        fid, verdict = parts[0], parts[1].lower()
+        rel = manifest.get(fid)
+        if rel is None:
+            print("warn: unknown id %s" % fid, file=sys.stderr)
+            continue
+        h_file = pack / rel
+        if verdict == "kill":
+            for f in (h_file, twin_of(opts, h_file)):
+                if f.exists():
+                    dst = bsides / f.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(f, dst)
+            killed += 1
+        elif verdict == "top":
+            rank = int(parts[2]) if len(parts) > 2 else 99
+            if h_file.exists():
+                topdir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(h_file, topdir / ("%02d - %s" % (rank, h_file.name)))
+                topped += 1
+    print("curate: %d killed to b-sides, %d in post first" % (killed, topped))
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1355,8 +1582,11 @@ def main(argv=None):
     add_common(sp)
     sp.add_argument("--min-source", type=float, default=45.0,
                     help="only pick from videos this long or longer (default 45)")
-    sp.add_argument("--target-len", type=float, default=14.0,
-                    help="preferred clip length seconds (default 14)")
+    sp.add_argument("--target-len", type=float, default=0.0,
+                    help="clip length seconds, 0 = per type: drone 20, "
+                         "camera 12, phone 8")
+    sp.add_argument("--workers", type=int, default=3,
+                    help="parallel analysis decodes (default 3)")
     sp.add_argument("--min-len", type=float, default=6.0,
                     help="shortest usable clip seconds (default 6)")
     sp.add_argument("--scene", type=float, default=0.35,
@@ -1406,6 +1636,13 @@ def main(argv=None):
     sp.add_argument("--length", type=float, default=12.0,
                     help="clip seconds when a pick has no end time (default 12)")
 
+    sp = sub.add_parser("frames", help="dump review strips for every pick")
+    add_common(sp)
+
+    sp = sub.add_parser("curate", help="apply keep/kill/top verdicts")
+    sp.add_argument("verdicts", help="verdict file: '0012 kill' or '0007 top 3'")
+    add_common(sp)
+
     opts = ap.parse_args(argv)
     opts.encoder_name = choose_encoder(opts.encoder)
     if opts.command in ("mirror", "cut") or (
@@ -1420,6 +1657,8 @@ def main(argv=None):
         "clips": cmd_clips,
         "sheet": cmd_sheet,
         "cut": cmd_cut,
+        "frames": cmd_frames,
+        "curate": cmd_curate,
     }[opts.command](opts)
 
 
