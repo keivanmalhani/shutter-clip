@@ -47,6 +47,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mts", ".avi", ".mkv"}
 OUT_ROOT_NAME = "_phone-ready"
 # Folder names skipped everywhere, matched case-insensitively as substrings.
@@ -2159,11 +2161,11 @@ def add_common(sp, root=True):
 
 
 def main(argv=None):
-    which_or_die()
     ap = argparse.ArgumentParser(
         prog="shutter_clip.py",
         description="zero-edit social clips straight from a footage drive",
     )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("scan", help="inventory all videos")
@@ -2277,6 +2279,10 @@ def main(argv=None):
     add_common(sp)
 
     opts = ap.parse_args(argv)
+    # ffmpeg is only required once a real subcommand is running. Checking it
+    # before parse_args made --help and --version die on a machine without it,
+    # which is exactly the machine where you want to read the help.
+    which_or_die()
     opts.encoder_name = choose_encoder(opts.encoder)
     if opts.command in ("mirror", "cut") or (
         opts.command == "clips" and not opts.copy
