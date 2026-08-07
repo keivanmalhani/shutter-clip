@@ -2,6 +2,8 @@ _preview/
 _phone-ready/
 __pycache__/
 .pytest_cache/
+.venv/
+venv/
 .DS_Store
 ._*
 
