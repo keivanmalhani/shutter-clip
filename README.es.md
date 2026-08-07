@@ -76,7 +76,7 @@ Si shutter-select no esta instalado, `rank` lo dice y imprime el comando exacto 
 ## Formato de salida
 
 - Horizontal 1920x1080 por defecto. `--vertical` agrega un recorte central 1080x1920, `--vertical-only` lo reemplaza.
-- HEVC con etiqueta `hvc1`: la mitad del peso de H.264, nativo en iPhone. El encoder se elige solo: VideoToolbox por hardware en macOS, libx265 o libx264 en otros sistemas. Cambia con `--encoder x264` si algun reproductor se queja.
+- HEVC con etiqueta `hvc1`: la mitad del peso de H.264, nativo en iPhone. El encoder se elige solo: VideoToolbox por hardware en macOS, unas 5-10x el tiempo real, libx265 o libx264 en otros sistemas. Cambia con `--encoder x264` si algun reproductor se queja.
 - Las fuentes HDR HLG y PQ se mapean a SDR bt709 automaticamente.
 - Material en log: pasa `--lut tulook.cube` para hornear un look.
 
