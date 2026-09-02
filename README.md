@@ -4,8 +4,6 @@
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python 3.11+ stdlib only](https://img.shields.io/badge/python-3.11%2B%20stdlib%20only-blue.svg)
 
-English | [Espanol](README.es.md)
-
 ![shutter-clip demo: scan a footage drive, publish motion-ranked picks, deep-rank with shutter-select](docs/demo.gif)
 
 Zero-edit social clips straight from a footage drive. Point it at the SSD,
