@@ -47,6 +47,34 @@ class TestPickWindows:
         start, length, _ = picks[0]
         assert not (10 <= start < 30)
 
+    def test_a_dark_window_loses_even_when_it_has_more_motion(self):
+        """The case test_dark_windows_lose cannot see.
+
+        That test uses flat motion, so its winning pick avoids the dark stretch because
+        edge damping already pushed it to 5.0 s -- not because of the darkness penalty.
+        Deleting the penalty leaves it passing. Proved by mutation on 2026-09-02:
+        `if lscore < 0.3 * med_luma: w *= 0.4` replaced with `if False`, whole suite green.
+
+        Putting the motion INSIDE the dark stretch separates the two behaviours. At 10x
+        the surrounding motion the penalty still wins, which is the behaviour worth
+        pinning.
+
+        Where the real limit sits, measured by sweeping the ratio rather than derived
+        from the weights: the penalty holds at 6x the surrounding motion and gives way
+        somewhere between 6x and 10x, where a dark window starts winning. That is a
+        deliberate trade -- a genuinely frantic dark shot can still win -- not a defect,
+        but it was undocumented and nothing pinned either side of it.
+        """
+        meta = make_meta(duration=60.0)
+        times, motion, luma = flat_series()
+        luma = [10.0 if 10 <= t < 30 else 120.0 for t in times]
+        motion = [0.3 if 12 <= t < 26 else 0.05 for t in times]
+        picks = sc.pick_windows(meta, (times, motion, luma), target_len=8,
+                                min_len=4, cut_thr=0.4, max_picks=1)
+        start, length, _ = picks[0]
+        assert not (10 <= start < 30), (
+            "picked a dark window at %.1fs even though it is only 6x the motion" % start)
+
     def test_high_motion_wins(self):
         meta = make_meta(duration=60.0)
         times, motion, luma = flat_series()
