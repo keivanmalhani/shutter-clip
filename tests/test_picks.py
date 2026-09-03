@@ -114,6 +114,42 @@ class TestPickWindows:
         for start, length, _ in picks:
             assert start + length <= cut_at + 0.51 or start >= cut_at
 
+    def test_a_doubled_cut_does_not_delete_the_segment_after_it(self):
+        """The case test_windows_respect_cut_boundaries cannot see.
+
+        The boundary loop is `if m >= cut_thr and t - bounds[-1] > 1.0`. That second
+        clause stops one hard cut, detected in two neighbouring bins, from opening two
+        segment boundaries half a second apart. Dropping it left the whole suite green,
+        because test_windows_respect_cut_boundaries plants a single spike: with one spike
+        the boundaries come out [0.0, 30.0, 60.0] gate or no gate, so the gate is invisible
+        to it.
+
+        Here the cut at 30 s is detected at both 30.0 and 30.5, which is what a real
+        cross-dissolve or a flash looks like after binning. The action worth clipping is
+        the five seconds after it.
+
+          with the gate    bounds [0.0, 30.0, 35.0]  -> the tail is 5.0 s, long enough
+          without the gate bounds [0.0, 30.0, 30.5, 35.0] -> the tail is 4.5 s, dropped
+
+        So without the gate the only usable window in the file is deleted and the pick
+        falls back to the flat lead-in.
+        """
+        meta = make_meta(duration=35.0)
+        times = [i * 0.5 for i in range(70)]
+        motion = [
+            0.9 if t in (30.0, 30.5) else (0.5 if 31.0 <= t < 35.0 else 0.05)
+            for t in times
+        ]
+        luma = [120.0] * len(times)
+        picks = sc.pick_windows(meta, (times, motion, luma), target_len=5,
+                                min_len=5, cut_thr=0.7, max_picks=1)
+        assert picks
+        start, length, _ = picks[0]
+        assert start == 30.0, (
+            "picked %.1fs instead of the action at 30.0s: the doubled cut detection "
+            "shortened the last segment below min_len and deleted it" % start)
+        assert length == 5
+
     def test_empty_series_no_picks(self):
         meta = make_meta(duration=60.0)
         assert sc.pick_windows(meta, ([], [], []), 8, 4, 0.4, 3) == []
